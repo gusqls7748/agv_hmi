@@ -3,10 +3,12 @@
 #include <memory>
 #include <string>
 #include <map>
+#include <chrono>
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
+#include "std_msgs/msg/string.hpp" // 1. Publisher용 메시지 헤더 추가
 
 struct Location {
     double x;
@@ -21,6 +23,9 @@ public:
     Nav2Manager() : Node("agv_nav2_manager") {
         this->action_client_ = rclcpp_action::create_client<NavigateToPose>(
             this, "navigate_to_pose");
+
+        // 2. Publisher 생성 (/agv_status 토픽, 큐 크기 10)
+        this->status_publisher_ = this->create_publisher<std_msgs::msg::String>("/agv_status", 10);
 
         // 📌 기존 좌표 데이터 그대로 유지!
         location_map_["HOME"]     = { -0.13,  0.00 }; // 취소 시 복귀할 원점
@@ -41,14 +46,19 @@ public:
         RCLCPP_INFO(this->get_logger(), "[이동 명령 수신] %s -> 좌표 (x: %.2f, y: %.2f)", 
                     destination.c_str(), target.x, target.y);
 
+        // 3. [토픽 발행] 목적지 이동 토픽 쏘기
+        publishStatus("NAVIGATING_TO_" + destination);
+
         sendGoal(target.x, target.y);
         return true;
     }
 
-    // 🔑 [이 부분이 누락되어 에러가 발생했습니다!]
     // 취소 명령 수신 시: 진행 중인 Goal 취소 후 HOME(-0.13, 0.00)으로 이동
     void cancelAndReturnHome() {
         RCLCPP_INFO(this->get_logger(), "[취소 명령 수신] 이동 취소 후 HOME(-0.13, 0.00)으로 복귀합니다.");
+
+        // 4. [토픽 발행] 취소 및 귀환 시작 토픽 쏘기
+        publishStatus("CANCEL_AND_RETURNING_HOME");
 
         // 1. 현재 수행 중인 모든 Goal 액션 취소
         if (this->action_client_) {
@@ -68,6 +78,18 @@ public:
 private:
     rclcpp_action::Client<NavigateToPose>::SharedPtr action_client_;
     std::map<std::string, Location> location_map_;
+
+    // 5. Publisher 멤버 변수 선언
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_publisher_;
+
+    // 6. 토픽 발행 헬퍼 함수 (상태 문자열 발행)
+    void publishStatus(const std::string& status_text) {
+        if (status_publisher_) {
+            auto msg = std_msgs::msg::String();
+            msg.data = status_text;
+            status_publisher_->publish(msg);
+        }
+    }
 
     void sendGoal(double x, double y) {
         if (!this->action_client_->wait_for_action_server(std::chrono::seconds(3))) {
@@ -90,10 +112,16 @@ private:
             [this](const GoalHandleNavigateToPose::WrappedResult & result) {
                 if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
                     RCLCPP_INFO(this->get_logger(), "🎯 목적지 도착 완료!");
+                    // 7. [토픽 발행] 도착 완료 토픽
+                    publishStatus("ARRIVED");
                 } else if (result.code == rclcpp_action::ResultCode::CANCELED) {
                     RCLCPP_INFO(this->get_logger(), "🛑 이동 명령이 취소되었습니다.");
+                    // 8. [토픽 발행] 취소 상태 토픽
+                    publishStatus("CANCELED");
                 } else {
                     RCLCPP_ERROR(this->get_logger(), "❌ 목적지 이동 실패!");
+                    // 9. [토픽 발행] 이동 실패 토픽
+                    publishStatus("FAILED");
                 }
             };
 

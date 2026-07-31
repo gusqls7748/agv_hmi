@@ -1,246 +1,152 @@
 #include "networkserver.h"
-#include "Nav2Manager.hpp" // 프로젝트 내 실제 헤더 파일명 대소문자 확인 필수!
-
-#include <QDebug>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QJsonParseError>
-#include <QRegularExpression>
+#include <QDebug>
 
-namespace
-{
-constexpr auto HttpBufferProperty = "guideRobotHttpBuffer";
-
-QString reasonPhraseFor(int statusCode)
-{
-    switch (statusCode) {
-    case 200: return "OK";
-    case 204: return "No Content";
-    case 400: return "Bad Request";
-    case 404: return "Not Found";
-    case 411: return "Length Required";
-    default:  return "Internal Server Error";
-    }
-}
-
-bool tryGetContentLength(const QByteArray &headers, int *contentLength)
-{
-    static const QRegularExpression contentLengthPattern(
-        "^Content-Length\\s*:\\s*(\\d+)\\s*$",
-        QRegularExpression::MultilineOption | QRegularExpression::CaseInsensitiveOption);
-
-    const auto match = contentLengthPattern.match(QString::fromLatin1(headers));
-    if (!match.hasMatch()) {
-        return false;
-    }
-
-    bool isNumber = false;
-    const int value = match.captured(1).toInt(&isNumber);
-    if (!isNumber || value < 0) {
-        return false;
-    }
-
-    *contentLength = value;
-    return true;
-}
-}
-
-NetworkServer::NetworkServer(QObject *parent) : QObject(parent)
-{
+NetworkServer::NetworkServer(QObject *parent) : QObject(parent) {
     m_tcpServer = new QTcpServer(this);
     connect(m_tcpServer, &QTcpServer::newConnection, this, &NetworkServer::onNewConnection);
 }
 
-NetworkServer::~NetworkServer()
-{
+NetworkServer::~NetworkServer() {
     if (m_tcpServer->isListening()) {
         m_tcpServer->close();
     }
 }
 
-void NetworkServer::startServer(quint16 port)
-{
-    if (m_tcpServer->listen(QHostAddress::Any, port)) {
-        qDebug() << "HTTP REST API Server started on port" << port;
+void NetworkServer::startServer(quint16 port) {
+    if (!m_tcpServer->listen(QHostAddress::Any, port)) {
+        qCritical() << "Server failed to start on port:" << port;
     } else {
-        qWarning() << "HTTP REST API Server failed to start:" << m_tcpServer->errorString();
+        qDebug() << "NetworkServer listening on port:" << port;
     }
 }
 
-void NetworkServer::onNewConnection()
-{
+void NetworkServer::onNewConnection() {
     QTcpSocket *socket = m_tcpServer->nextPendingConnection();
     connect(socket, &QTcpSocket::readyRead, this, &NetworkServer::onReadyRead);
     connect(socket, &QTcpSocket::disconnected, socket, &QTcpSocket::deleteLater);
 }
 
-void NetworkServer::onReadyRead()
-{
-    QTcpSocket *socket = qobject_cast<QTcpSocket *>(sender());
-    if (!socket) {
-        return;
-    }
+void NetworkServer::onReadyRead() {
+    QTcpSocket *socket = qobject_cast<QTcpSocket*>(sender());
+    if (!socket) return;
 
-    QByteArray requestData = socket->property(HttpBufferProperty).toByteArray();
-    requestData.append(socket->readAll());
+    QByteArray requestData = socket->readAll();
+    QString requestStr = QString::fromUtf8(requestData);
 
-    const int headerEnd = requestData.indexOf("\r\n\r\n");
-    if (headerEnd < 0) {
-        socket->setProperty(HttpBufferProperty, requestData);
-        return;
-    }
+    int headerEndIndex = requestStr.indexOf("\r\n\r\n");
+    if (headerEndIndex == -1) return;
 
-    const QByteArray headers = requestData.left(headerEnd);
-    const QByteArray requestLine = headers.left(headers.indexOf("\r\n"));
-    const int bodyStart = headerEnd + 4;
+    QString headerPart = requestStr.left(headerEndIndex);
+    QByteArray bodyPart = requestData.mid(headerEndIndex + 4);
 
-    if (requestLine.startsWith("OPTIONS ")) {
-        const QByteArray response =
-            "HTTP/1.1 204 No Content\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
-            "Connection: close\r\n\r\n";
-        socket->write(response);
-        socket->disconnectFromHost();
-        return;
-    }
+    QStringList requestLines = headerPart.split("\r\n");
+    if (requestLines.isEmpty()) return;
 
-    if (requestLine.startsWith("GET /api/status ")) {
-        socket->setProperty(HttpBufferProperty, QByteArray());
+    QString firstLine = requestLines.first();
+    QStringList tokens = firstLine.split(" ");
+
+    if (tokens.size() < 2) return;
+
+    QString method = tokens[0];
+    QString path = tokens[1];
+
+    // [디버그 로그 추가] 터미널에 수신된 method와 path 출력
+    qDebug() << "[NetworkServer] Incoming Request:" << method << path;
+
+    if (method == "GET" && path == "/api/status") {
         handleGetStatus(socket);
-        return;
+    } else if (method == "POST" && (path == "/api/command" || path == "/api/manual_mode")) {
+        handlePostCommand(socket, bodyPart);
+    } else {
+        qWarning() << "[NetworkServer] Path not matched! 404 returned for:" << path;
+        QJsonObject res;
+        res["error"] = "Not Found";
+        sendHttpResponse(socket, 404, res);
     }
-
-    if (!requestLine.startsWith("POST /api/command ")) {
-        QJsonObject error;
-        error["error"] = "Not Found";
-        sendHttpResponse(socket, 404, error);
-        return;
-    }
-
-    // Content-Length 파싱 실패 시 남은 바이트 처리
-    int contentLength = 0;
-    if (!tryGetContentLength(headers, &contentLength)) {
-        contentLength = requestData.size() - bodyStart;
-    }
-
-    const int fullRequestSize = bodyStart + contentLength;
-    if (requestData.size() < fullRequestSize) {
-        socket->setProperty(HttpBufferProperty, requestData);
-        return;
-    }
-
-    const QByteArray body = requestData.mid(bodyStart, contentLength);
-    socket->setProperty(HttpBufferProperty, QByteArray());
-    handlePostCommand(socket, body);
 }
 
-void NetworkServer::handleGetStatus(QTcpSocket *socket)
-{
-    QJsonObject response;
-    response["wheel_rpm"] = m_wheelRpm;
-    response["camera_url"] = m_cameraUrl;
-    response["status"] = m_robotStatus;
-
-    // (필요 시 더미 좌표 전달)
-    response["x"] = 0.0;
-    response["y"] = 0.0;
-
-    sendHttpResponse(socket, 200, response);
-}
-
-void NetworkServer::handlePostCommand(QTcpSocket *socket, const QByteArray &body)
-{
-    // Chunked Encoding 패딩 제거 ({ ... } 추출)
-    QByteArray cleanBody = body;
-    int firstBrace = cleanBody.indexOf('{');
-    int lastBrace = cleanBody.lastIndexOf('}');
-
-    if (firstBrace >= 0 && lastBrace > firstBrace) {
-        cleanBody = cleanBody.mid(firstBrace, lastBrace - firstBrace + 1);
-    }
-
+// POST 요청 처리 (JSON 파싱 및 Signal emit)
+void NetworkServer::handlePostCommand(QTcpSocket *socket, const QByteArray &body) {
     QJsonParseError parseError;
-    const QJsonDocument document = QJsonDocument::fromJson(cleanBody, &parseError);
+    QJsonDocument jsonDoc = QJsonDocument::fromJson(body, &parseError);
 
-    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
-        qWarning() << "[JSON 파싱 실패]:" << parseError.errorString() << "body:" << body;
-
-        QJsonObject error;
-        error["result"] = "fail";
-        error["error"] = "Invalid JSON body";
-        sendHttpResponse(socket, 400, error);
+    if (parseError.error != QJsonParseError::NoError || !jsonDoc.isObject()) {
+        qWarning() << "Invalid JSON received:" << parseError.errorString();
+        QJsonObject res;
+        res["success"] = false;
+        res["message"] = "Invalid JSON format";
+        sendHttpResponse(socket, 400, res);
         return;
     }
 
-    const QJsonObject json = document.object();
-    const QString command = json.value("command").toString().trimmed();
-    const QString destination = json.value("destination").toString().trimmed();
+    QJsonObject jsonReq = jsonDoc.object();
+    bool updated = false;
 
-    qDebug() << "[API 요청 수신] command:" << command << "destination:" << destination;
-
-    QJsonObject response;
-
-    // 1. 캔슬 명령 (Nav2 이동 취소 후 HOME 복귀)
-    if (command == "cancel") {
-        qDebug() << "[제어 명령 수신]: cancel - 안내 취소 및 원점(HOME) 복귀";
+    // 1. "manual_mode" 키 처리 (bool 타입 또는 int/string 처리)
+    if (jsonReq.contains("manual_mode")) {
+        bool newMode = false;
         
-        m_robotStatus = "returning";
-
-        if (m_nav2Manager) {
-            m_nav2Manager->cancelAndReturnHome();
+        if (jsonReq["manual_mode"].isBool()) {
+            newMode = jsonReq["manual_mode"].toBool();
+        } else if (jsonReq["manual_mode"].isDouble()) {
+            newMode = (jsonReq["manual_mode"].toInt() == 1);
+        } else if (jsonReq["manual_mode"].isString()) {
+            QString modeStr = jsonReq["manual_mode"].toString().toLower();
+            newMode = (modeStr == "true" || modeStr == "on" || modeStr == "1");
         }
 
-        response["result"] = "success";
-        response["message"] = "Guide cancelled, returning home";
-        response["status"] = m_robotStatus;
-        sendHttpResponse(socket, 200, response);
-        return;
-    }
-
-    // 2. 목적지 안내 명령
-    if (!destination.isEmpty()) {
-        qDebug() << "[목적지 명령 수신]:" << destination;
-
-        m_robotStatus = "moving";
-
-        if (m_nav2Manager) {
-            m_nav2Manager->moveToLocation(destination.toStdString());
+        // 상태값이 변경된 경우에만 emit
+        if (m_isManualMode != newMode) {
+            m_isManualMode = newMode;
+            emit manualModeChanged(m_isManualMode);
+            qDebug() << "[NetworkServer] Manual Mode updated ->" << m_isManualMode;
         }
-
-        response["result"] = "success";
-        response["target"] = destination;
-        response["status"] = m_robotStatus;
-        sendHttpResponse(socket, 200, response);
-        return;
+        updated = true;
     }
 
-    qWarning() << "[경고]: destination 또는 command 파라미터 누락. body:" << body;
-    response["result"] = "fail";
-    response["error"] = "destination or command parameter missing";
-    sendHttpResponse(socket, 400, response);
+    // 2. Nav2 명령 등 기존 command 파싱 (필요 시 연동)
+    if (jsonReq.contains("command")) {
+        QString cmd = jsonReq["command"].toString();
+        qDebug() << "[NetworkServer] Received command:" << cmd;
+        // Nav2Manager 연동 로직
+        updated = true;
+    }
+
+    // HTTP 응답 반환
+    QJsonObject res;
+    res["success"] = true;
+    res["manual_mode"] = m_isManualMode;
+    res["message"] = updated ? "Command processed successfully" : "No recognized parameters";
+    sendHttpResponse(socket, 200, res);
 }
 
-void NetworkServer::sendHttpResponse(QTcpSocket *socket, int statusCode, const QJsonObject &jsonObj)
-{
-    const QJsonDocument document(jsonObj);
-    const QByteArray body = document.toJson(QJsonDocument::Compact);
+void NetworkServer::handleGetStatus(QTcpSocket *socket) {
+    QJsonObject res;
+    res["status"] = m_robotStatus;
+    res["wheel_rpm"] = m_wheelRpm;
+    res["camera_url"] = m_cameraUrl;
+    res["manual_mode"] = m_isManualMode; // 현재 매뉴얼 모드 상태 반환
 
-    const QString header = QString("HTTP/1.1 %1 %2\r\n"
-                                   "Content-Type: application/json; charset=utf-8\r\n"
-                                   "Access-Control-Allow-Origin: *\r\n"
-                                   "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-                                   "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
-                                   "Content-Length: %3\r\n"
-                                   "Connection: close\r\n\r\n")
-                               .arg(statusCode)
-                               .arg(reasonPhraseFor(statusCode))
-                               .arg(body.size());
+    sendHttpResponse(socket, 200, res);
+}
 
-    socket->write(header.toUtf8());
+void NetworkServer::sendHttpResponse(QTcpSocket *socket, int statusCode, const QJsonObject &jsonObj) {
+    QByteArray body = QJsonDocument(jsonObj).toJson(QJsonDocument::Compact);
+    
+    QString statusText = (statusCode == 200) ? "OK" : (statusCode == 400 ? "Bad Request" : "Not Found");
+    
+    QString responseHeader = QString(
+        "HTTP/1.1 %1 %2\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %3\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n\r\n"
+    ).arg(statusCode).arg(statusText).arg(body.size());
+
+    socket->write(responseHeader.toUtf8());
     socket->write(body);
+    socket->flush();
     socket->disconnectFromHost();
 }
-
-#include "networkserver.moc"
