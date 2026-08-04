@@ -32,19 +32,34 @@ void NetworkServer::onReadyRead() {
     QTcpSocket *socket = qobject_cast<QTcpSocket*>(sender());
     if (!socket) return;
 
+    // 소켓 버퍼 데이터 전부 수신
     QByteArray requestData = socket->readAll();
     QString requestStr = QString::fromUtf8(requestData);
 
     int headerEndIndex = requestStr.indexOf("\r\n\r\n");
-    if (headerEndIndex == -1) return;
+    if (headerEndIndex == -1) return; // 헤더가 다 안 들어왔으면 일단 대기
 
     QString headerPart = requestStr.left(headerEndIndex);
     QByteArray bodyPart = requestData.mid(headerEndIndex + 4);
 
-    QStringList requestLines = headerPart.split("\r\n");
-    if (requestLines.isEmpty()) return;
+    // 헤더에서 Content-Length 추출하여 body가 다 모였는지 확인
+    int contentLength = 0;
+    QStringList headerLines = headerPart.split("\r\n");
+    for (const QString &line : headerLines) {
+        if (line.startsWith("Content-Length:", Qt::CaseInsensitive)) {
+            contentLength = line.section(':', 1).trimmed().toInt();
+            break;
+        }
+    }
 
-    QString firstLine = requestLines.first();
+    // 본문이 아직 다 안 들어왔으면 대기 (패킷 쪼개짐 방지)
+    if (contentLength > 0 && bodyPart.size() < contentLength) {
+        return; 
+    }
+
+    if (headerLines.isEmpty()) return;
+
+    QString firstLine = headerLines.first();
     QStringList tokens = firstLine.split(" ");
 
     if (tokens.size() < 2) return;
@@ -52,7 +67,6 @@ void NetworkServer::onReadyRead() {
     QString method = tokens[0];
     QString path = tokens[1];
 
-    // [디버그 로그 추가] 터미널에 수신된 method와 path 출력
     qDebug() << "[NetworkServer] Incoming Request:" << method << path;
 
     if (method == "GET" && path == "/api/status") {
@@ -67,16 +81,30 @@ void NetworkServer::onReadyRead() {
     }
 }
 
-// POST 요청 처리 (JSON 파싱 및 Signal emit)
+// POST 요청 처리 (destination / command / manual_mode 파싱)
 void NetworkServer::handlePostCommand(QTcpSocket *socket, const QByteArray &body) {
+    qDebug() << "[NetworkServer] Received Raw Body:" << body;
+
+    QByteArray cleanBody = body;
+
+    // 핵심 수정 부분: Chunked 인코딩 껍데기(1a\r\n ... \r\n0\r\n\r\n) 제거 로직
+    int firstJsonBrace = cleanBody.indexOf('{');
+    int lastJsonBrace = cleanBody.lastIndexOf('}');
+
+    if (firstJsonBrace != -1 && lastJsonBrace != -1 && lastJsonBrace > firstJsonBrace) {
+        cleanBody = cleanBody.mid(firstJsonBrace, (lastJsonBrace - firstJsonBrace + 1));
+        qDebug() << "[NetworkServer] Cleaned Body:" << cleanBody;
+    }
+
     QJsonParseError parseError;
-    QJsonDocument jsonDoc = QJsonDocument::fromJson(body, &parseError);
+    QJsonDocument jsonDoc = QJsonDocument::fromJson(cleanBody, &parseError);
 
     if (parseError.error != QJsonParseError::NoError || !jsonDoc.isObject()) {
-        qWarning() << "Invalid JSON received:" << parseError.errorString();
+        qWarning() << "[API 400] Invalid JSON received:" << parseError.errorString();
+        qWarning() << "[API 400] Raw body was:" << body;
         QJsonObject res;
-        res["success"] = false;
-        res["message"] = "Invalid JSON format";
+        res["result"] = "fail";
+        res["error"] = "Invalid JSON format";
         sendHttpResponse(socket, 400, res);
         return;
     }
@@ -84,7 +112,25 @@ void NetworkServer::handlePostCommand(QTcpSocket *socket, const QByteArray &body
     QJsonObject jsonReq = jsonDoc.object();
     bool updated = false;
 
-    // 1. "manual_mode" 키 처리 (bool 타입 또는 int/string 처리)
+    // 1. "destination" 키 처리 (방 이동: room_301, room_302 등)
+    if (jsonReq.contains("destination")) {
+        QString dest = jsonReq["destination"].toString();
+        qDebug() << "[NetworkServer] Received destination:" << dest;
+        
+        // Nav2 이동 명령 연동 코드
+        
+        updated = true;
+    }
+
+    // 2. "command" 키 처리 (pause, resume, cancel 등)
+    if (jsonReq.contains("command")) {
+        QString cmd = jsonReq["command"].toString();
+        qDebug() << "[NetworkServer] Received command:" << cmd;
+        
+        updated = true;
+    }
+
+    // 3. "manual_mode" 키 처리
     if (jsonReq.contains("manual_mode")) {
         bool newMode = false;
         
@@ -97,7 +143,6 @@ void NetworkServer::handlePostCommand(QTcpSocket *socket, const QByteArray &body
             newMode = (modeStr == "true" || modeStr == "on" || modeStr == "1");
         }
 
-        // 상태값이 변경된 경우에만 emit
         if (m_isManualMode != newMode) {
             m_isManualMode = newMode;
             emit manualModeChanged(m_isManualMode);
@@ -106,20 +151,18 @@ void NetworkServer::handlePostCommand(QTcpSocket *socket, const QByteArray &body
         updated = true;
     }
 
-    // 2. Nav2 명령 등 기존 command 파싱 (필요 시 연동)
-    if (jsonReq.contains("command")) {
-        QString cmd = jsonReq["command"].toString();
-        qDebug() << "[NetworkServer] Received command:" << cmd;
-        // Nav2Manager 연동 로직
-        updated = true;
-    }
-
-    // HTTP 응답 반환
+    // 결과 응답
     QJsonObject res;
-    res["success"] = true;
-    res["manual_mode"] = m_isManualMode;
-    res["message"] = updated ? "Command processed successfully" : "No recognized parameters";
-    sendHttpResponse(socket, 200, res);
+    if (updated) {
+        res["result"] = "success";
+        res["message"] = "Command processed successfully";
+        sendHttpResponse(socket, 200, res);
+    } else {
+        qWarning() << "[API 400] Neither destination nor command parameter missing";
+        res["result"] = "fail";
+        res["error"] = "destination or command parameter missing";
+        sendHttpResponse(socket, 400, res);
+    }
 }
 
 void NetworkServer::handleGetStatus(QTcpSocket *socket) {
@@ -127,7 +170,7 @@ void NetworkServer::handleGetStatus(QTcpSocket *socket) {
     res["status"] = m_robotStatus;
     res["wheel_rpm"] = m_wheelRpm;
     res["camera_url"] = m_cameraUrl;
-    res["manual_mode"] = m_isManualMode; // 현재 매뉴얼 모드 상태 반환
+    res["manual_mode"] = m_isManualMode;
 
     sendHttpResponse(socket, 200, res);
 }
