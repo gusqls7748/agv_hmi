@@ -1,5 +1,72 @@
 서버를 켤 때의 순서와 팀원들에게 각각 어떤 주소를 줘야 하는지 깔끔하게 정리해 드리겠습니다. 로봇 현장에서 서버를 켤 때는 **순서대로 터미널을 열고 실행**하셔야 충돌이 안 납니다.
 
+
+## 2026/08/12
+
+로봇 본체에서 서버와 터널을 켜는 **전체 실행 순서**를 깔끔하게 정리해 드립니다. 터미널 창을 총 **3개** 띄워서 순서대로 실행하시면 됩니다.
+
+---
+
+### 🚀 [1단계] C++ 백엔드 서버 실행 (8080 포트)
+
+* **첫 번째 터미널**에서 실행:
+```bash
+cd ~
+source install/setup.bash
+ros2 run agv_hmi_server agv_hmi_server
+
+```
+
+
+* *정상 실행 시: `NetworkServer listening on port: 8080` 메시지가 뜹니다.*
+
+
+
+---
+
+### 🌐 [2단계] Qt 팀용 외부 터널 연결 (8080 포트)
+
+* **두 번째 터미널**에서 실행:
+```bash
+cloudflared tunnel --protocol http2 --url http://localhost:8080
+
+```
+
+
+* *출력되는 주소 중 `https://[영어단어].trycloudflare.com` 형태의 주소를 **Qt 팀**에게 전달합니다.*
+
+
+
+---
+
+### 🖥️ [3단계] 웹 HMI(UI) 서버 및 터널 실행 (8000 포트)
+
+1. **웹 서버 실행:** 세 번째 터미널에서 실행
+```bash
+cd ~/GuideRobot_WebHmi/GuideRobot.WebHmi-ubuntu-net10-final
+RobotServer__BaseUrl=http://127.0.0.1:8080/ dotnet GuideRobot.WebHmi.dll --urls http://127.0.0.1:8000
+
+```
+
+
+2. **웹 터널 실행:** 네 번째 터미널(또는 새 탭)에서 실행
+```bash
+cloudflared tunnel --protocol http2 --url http://localhost:8000
+
+```
+
+
+* *출력되는 주소(`[https://womens-study-vampire-endorsement.trycloudflare.com](https://womens-study-vampire-endorsement.trycloudflare.com)`)를 **웹 UI 팀**에게 전달합니다.*
+
+
+
+---
+
+### 💡 주의사항
+
+* 테스트가 진행되는 동안 위 **4개의 터미널 창을 모두 끄지 말고 켜둔 상태**로 유지해 주세요.
+
+
 ---
 
 ### 🚀 [1단계] 로봇 본체 PC에서 서버 켜는 순서
