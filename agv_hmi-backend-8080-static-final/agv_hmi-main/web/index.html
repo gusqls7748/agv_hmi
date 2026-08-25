@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#12355b">
+    <title>GuideRobot | 안내 로봇</title>
+    <link rel="icon" type="image/svg+xml" href="robot-mark.svg">
+    <link rel="stylesheet" href="app.css">
+    <script src="app.js" defer></script>
+</head>
+<body>
+    <div class="app-shell">
+        <header class="app-topbar">
+            <a class="brand" href="/" aria-label="GuideRobot 홈">
+                <img src="robot-mark.svg" alt="">
+                <span>GuideRobot</span>
+            </a>
+        </header>
+
+        <main>
+            <article class="content">
+                <div class="guide-page">
+                    <section class="hero-card">
+                        <div>
+                            <p class="eyebrow">GUIDEROBOT</p>
+                            <h1 id="hero-title">어디로 안내할까요?</h1>
+                            <p id="hero-description" class="hero-description">GuideRobot이 길을 안내해 드립니다.</p>
+                        </div>
+                        <div class="robot-badge" aria-hidden="true">
+                            <img src="robot-mark.svg" alt="">
+                        </div>
+                    </section>
+
+                    <section id="destination-section" class="destination-section" aria-labelledby="destination-title">
+                        <div class="section-heading">
+                            <div>
+                                <p class="section-label">목적지 선택</p>
+                                <h2 id="destination-title">어디로 가시겠어요?</h2>
+                            </div>
+                            <span id="selected-destination" class="selected-destination" hidden></span>
+                        </div>
+
+                        <div id="destination-grid" class="destination-grid">
+                            <button class="destination-button" type="button" data-destination="restroom" aria-pressed="false">
+                                <span class="destination-pin" aria-hidden="true">🚻</span>
+                                <span>화장실 앞</span>
+                            </button>
+                            <button class="destination-button" type="button" data-destination="room_301" aria-pressed="false">
+                                <span class="destination-pin" aria-hidden="true">🏫</span>
+                                <span>강의실 301호</span>
+                            </button>
+                            <button class="destination-button" type="button" data-destination="room_302" aria-pressed="false">
+                                <span class="destination-pin" aria-hidden="true">🏫</span>
+                                <span>강의실 302호</span>
+                            </button>
+                            <button class="destination-button" type="button" data-destination="elevator" aria-pressed="false">
+                                <span class="destination-pin" aria-hidden="true">🛗</span>
+                                <span>엘리베이터 앞</span>
+                            </button>
+                        </div>
+                    </section>
+
+                    <button id="start-button" class="start-button" type="button" disabled>
+                        <span aria-hidden="true">→</span>
+                        안내 시작
+                    </button>
+
+                    <p id="command-result" class="command-result" role="status" hidden></p>
+
+                    <section id="journey-card" class="journey-card" aria-live="polite" hidden>
+                        <div class="journey-heading">
+                            <div>
+                                <p id="journey-label" class="section-label">안내 진행 상황</p>
+                                <h2 id="journey-destination"></h2>
+                            </div>
+                            <strong id="guidance-state" class="guidance-state">안내 중</strong>
+                        </div>
+
+                        <div id="journey-message" class="journey-message">
+                            <span id="journey-pulse" class="pulse-dot" aria-hidden="true"></span>
+                            <p id="journey-message-text">안내 중입니다. 로봇을 따라와 주세요.</p>
+                        </div>
+
+                        <button id="secondary-button" class="secondary-button" type="button">안내 취소</button>
+                        <p id="control-error" class="command-result failure" role="alert" hidden></p>
+                    </section>
+                </div>
+            </article>
+        </main>
+    </div>
+
+    <div id="confirmation-backdrop" class="confirmation-backdrop" hidden>
+        <section class="confirmation-dialog" role="dialog" aria-modal="true" aria-labelledby="confirmation-title">
+            <div id="confirmation-icon" class="confirmation-icon" aria-hidden="true"></div>
+            <p class="section-label">안내 시작 확인</p>
+            <h2 id="confirmation-title"><strong id="confirmation-destination"></strong><br>안내를 시작할까요?</h2>
+            <div class="confirmation-actions">
+                <button id="confirmation-cancel" class="confirmation-cancel" type="button">취소</button>
+                <button id="confirmation-start" class="confirmation-start" type="button">안내 시작</button>
+            </div>
+        </section>
+    </div>
+
+    <div id="manual-control-overlay" class="manual-control-overlay" role="dialog" aria-modal="true" aria-labelledby="manual-control-title" aria-describedby="manual-control-description" hidden>
+        <section class="manual-control-dialog">
+            <div class="manual-control-icon" aria-hidden="true">
+                <img src="robot-mark.svg" alt="">
+            </div>
+            <p class="section-label">MANUAL CONTROL</p>
+            <h2 id="manual-control-title">관리자가 제어 중입니다</h2>
+            <p id="manual-control-description">수동 제어가 끝날 때까지 잠시 기다려 주세요.</p>
+            <div class="manual-control-status">
+                <span class="pulse-dot" aria-hidden="true"></span>
+                관리자 제어 연결됨
+            </div>
+        </section>
+    </div>
+
+    <noscript>GuideRobot 웹을 사용하려면 JavaScript를 활성화해 주세요.</noscript>
+</body>
+</html>
