@@ -1,6 +1,7 @@
 #include "networkserver.h"
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QSet>
 #include <QDebug>
 
 NetworkServer::NetworkServer(QObject *parent) : QObject(parent) {
@@ -120,8 +121,17 @@ void NetworkServer::handlePostCommand(QTcpSocket *socket, const QByteArray &body
     if (jsonReq.contains("destination")) {
         QString dest = jsonReq["destination"].toString();
         qDebug() << "[NetworkServer] Received destination:" << dest;
-        
-        // TODO: Nav2 이동 명령 연동 시그널/함수 호출
+
+        bool accepted = m_nav2Manager && m_nav2Manager->moveToLocation(dest.toStdString());
+
+        if (!accepted) {
+            qWarning() << "[NetworkServer] Rejected destination:" << dest;
+            QJsonObject res;
+            res["result"] = "fail";
+            res["error"] = "등록되지 않은 목적지이거나 Nav2Manager가 연결되지 않았습니다: " + dest;
+            sendHttpResponse(socket, 400, res);
+            return;
+        }
         updated = true;
     }
 
@@ -129,9 +139,32 @@ void NetworkServer::handlePostCommand(QTcpSocket *socket, const QByteArray &body
     if (jsonReq.contains("command")) {
         QString cmd = jsonReq["command"].toString();
         qDebug() << "[NetworkServer] Received command:" << cmd;
-        
-        // TODO: 수동 제어(forward/backward/left/right/stop) 및 명령(cancel 등) 연동
-        updated = true;
+
+        static const QSet<QString> manualDirections = {"forward", "backward", "left", "right", "stop"};
+
+        if (cmd == "cancel") {
+            if (m_nav2Manager) {
+                m_nav2Manager->cancelAndReturnHome();
+            }
+            updated = true;
+        } else if (manualDirections.contains(cmd)) {
+            // manual_mode가 켜져 있을 때만 수동 조종을 허용합니다.
+            // (자동 주행 중에 실수로 forward/left 등이 들어와 Nav2 목표와 충돌하는 것을 방지)
+            if (!m_isManualMode) {
+                qWarning() << "[NetworkServer] Manual command rejected (not in manual mode):" << cmd;
+                QJsonObject res;
+                res["result"] = "fail";
+                res["error"] = "manual_mode가 꺼져 있어 수동 조종을 거부했습니다. 먼저 manual_mode:true를 보내주세요.";
+                sendHttpResponse(socket, 409, res);
+                return;
+            }
+            if (m_nav2Manager) {
+                m_nav2Manager->manualDrive(cmd.toStdString());
+            }
+            updated = true;
+        } else {
+            qWarning() << "[NetworkServer] Unknown command value:" << cmd;
+        }
     }
 
     // 3. "manual_mode" 키 처리
@@ -151,6 +184,11 @@ void NetworkServer::handlePostCommand(QTcpSocket *socket, const QByteArray &body
             m_isManualMode = newMode;
             emit manualModeChanged(m_isManualMode);
             qDebug() << "[NetworkServer] Manual Mode updated ->" << m_isManualMode;
+
+            // 수동 모드가 꺼지는 순간, 조종 중이던 로봇을 안전하게 정지시킵니다.
+            if (!m_isManualMode && m_nav2Manager) {
+                m_nav2Manager->stopManualDrive();
+            }
         }
         updated = true;
     }
@@ -183,7 +221,14 @@ void NetworkServer::handleGetStatus(QTcpSocket *socket) {
 void NetworkServer::sendHttpResponse(QTcpSocket *socket, int statusCode, const QJsonObject &jsonObj) {
     QByteArray body = QJsonDocument(jsonObj).toJson(QJsonDocument::Compact);
     
-    QString statusText = (statusCode == 200) ? "OK" : (statusCode == 400 ? "Bad Request" : "Not Found");
+    QString statusText;
+    switch (statusCode) {
+        case 200: statusText = "OK"; break;
+        case 400: statusText = "Bad Request"; break;
+        case 404: statusText = "Not Found"; break;
+        case 409: statusText = "Conflict"; break;
+        default:  statusText = "Error"; break;
+    }
     
     QString responseHeader = QString(
         "HTTP/1.1 %1 %2\r\n"

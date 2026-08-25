@@ -13,6 +13,7 @@
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
+#include "geometry_msgs/msg/twist.hpp"
 
 using namespace std::chrono_literals;
 
@@ -34,6 +35,7 @@ public:
         // 2. Publisher 생성
         this->status_publisher_ = this->create_publisher<std_msgs::msg::String>("/agv_status", 10);
         this->initial_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("/initialpose", 10);
+        this->cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
 
         // 3. Location Map 초기화
         location_map_["HOME"]     = { -0.13,  0.00 };
@@ -69,6 +71,11 @@ public:
         RCLCPP_INFO(this->get_logger(), "[취소 명령 수신] 이동 취소 후 HOME으로 복귀 요청...");
         publishStatus("CANCEL_AND_RETURNING_HOME");
 
+        // 수동 조종 중이었다면 먼저 멈춰서 Nav2 이동과 겹치지 않게 합니다.
+        if (manual_drive_timer_) {
+            manual_drive_timer_->cancel();
+        }
+
         if (this->action_client_) {
             // 현재 실행 중인 Goal들을 취소 요청하고, 취소가 끝난 후 HOME으로 이동
             this->action_client_->async_cancel_all_goals(
@@ -83,11 +90,66 @@ public:
         }
     }
 
+    // 📌 수동 조종 명령 처리 (forward/backward/left/right/stop)
+    // 대부분의 diff-drive 컨트롤러는 /cmd_vel에 watchdog(예: 0.5초 무통신 시 자동 정지)을 걸어두므로,
+    // 한 번만 publish하면 로봇이 잠깐 움직이다 멈춰버립니다.
+    // 그래서 방향이 바뀔 때마다 목표 속도를 갱신하고, 그 속도를 타이머로 계속 재발행합니다.
+    bool manualDrive(const std::string& direction) {
+        const double LINEAR_SPEED = 0.2;   // m/s
+        const double ANGULAR_SPEED = 0.5;  // rad/s
+
+        geometry_msgs::msg::Twist twist;
+        if (direction == "forward") {
+            twist.linear.x = LINEAR_SPEED;
+        } else if (direction == "backward") {
+            twist.linear.x = -LINEAR_SPEED;
+        } else if (direction == "left") {
+            twist.angular.z = ANGULAR_SPEED;
+        } else if (direction == "right") {
+            twist.angular.z = -ANGULAR_SPEED;
+        } else if (direction == "stop") {
+            // linear/angular 모두 기본값 0 (정지)
+        } else {
+            RCLCPP_WARN(this->get_logger(), "알 수 없는 수동 제어 명령입니다: %s", direction.c_str());
+            return false;
+        }
+
+        current_twist_ = twist;
+        cmd_vel_pub_->publish(current_twist_);
+        RCLCPP_INFO(this->get_logger(), "[수동 제어] %s (linear.x=%.2f, angular.z=%.2f)",
+                    direction.c_str(), twist.linear.x, twist.angular.z);
+
+        if (direction == "stop") {
+            // 정지 명령은 반복 발행할 필요 없이 타이머를 종료합니다.
+            if (manual_drive_timer_) {
+                manual_drive_timer_->cancel();
+            }
+        } else if (!manual_drive_timer_) {
+            // 첫 이동 명령일 때만 타이머를 새로 만듭니다 (100ms 주기 재발행).
+            manual_drive_timer_ = this->create_wall_timer(100ms, [this]() {
+                cmd_vel_pub_->publish(current_twist_);
+            });
+        }
+        return true;
+    }
+
+    // manual_mode가 꺼지거나 연결이 끊겼을 때 안전하게 로봇을 멈춥니다.
+    void stopManualDrive() {
+        if (manual_drive_timer_) {
+            manual_drive_timer_->cancel();
+        }
+        current_twist_ = geometry_msgs::msg::Twist();
+        cmd_vel_pub_->publish(current_twist_);
+    }
+
 private:
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_publisher_;
     rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
     rclcpp_action::Client<NavigateToPose>::SharedPtr action_client_;
     rclcpp::TimerBase::SharedPtr timer_;
+    rclcpp::TimerBase::SharedPtr manual_drive_timer_;
+    geometry_msgs::msg::Twist current_twist_;
     std::map<std::string, Location> location_map_;
 
     void setInitialPose() {
