@@ -1,0 +1,222 @@
+#ifndef NAV2_MANAGER_HPP
+#define NAV2_MANAGER_HPP
+
+#include <memory>
+#include <string>
+#include <map>
+#include <chrono>
+#include <functional>
+
+#include "rclcpp/rclcpp.hpp"
+#include "rclcpp_action/rclcpp_action.hpp"
+#include "std_msgs/msg/string.hpp"
+#include "nav2_msgs/action/navigate_to_pose.hpp"
+#include "geometry_msgs/msg/pose_stamped.hpp"
+#include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
+#include "geometry_msgs/msg/twist.hpp"
+
+using namespace std::chrono_literals;
+
+struct Location {
+    double x;
+    double y;
+};
+
+class Nav2Manager : public rclcpp::Node {
+public:
+    using NavigateToPose = nav2_msgs::action::NavigateToPose;
+    using GoalHandleNavigateToPose = rclcpp_action::ClientGoalHandle<NavigateToPose>;
+
+    Nav2Manager() : Node("agv_nav2_manager") {
+        // 1. Action Client 생성
+        this->action_client_ = rclcpp_action::create_client<NavigateToPose>(
+            this, "navigate_to_pose");
+
+        // 2. Publisher 생성
+        this->status_publisher_ = this->create_publisher<std_msgs::msg::String>("/agv_status", 10);
+        this->initial_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("/initialpose", 10);
+        this->cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
+
+        // 3. Location Map 초기화
+        location_map_["HOME"]     = { -0.13,  0.00 };
+        location_map_["room_301"] = { -4.00, -3.89 };
+        location_map_["room_302"] = {  3.99,  4.13 };
+        location_map_["room_303"] = {  1.50, -2.10 };
+        location_map_["room_304"] = {  0.00,  0.00 };
+        location_map_["room_305"] = {  0.00,  0.00 };
+
+        // 📌 4. 노드 시작 1초 후 초기 위치 1회 설정
+        this->timer_ = this->create_wall_timer(
+            1s, std::bind(&Nav2Manager::setInitialPose, this));
+    }
+
+    bool moveToLocation(const std::string& destination) {
+        auto it = location_map_.find(destination);
+        if (it == location_map_.end()) {
+            RCLCPP_WARN(this->get_logger(), "등록되지 않은 목적지입니다: %s", destination.c_str());
+            return false;
+        }
+
+        Location target = it->second;
+        RCLCPP_INFO(this->get_logger(), "[이동 명령 수신] %s -> 좌표 (x: %.2f, y: %.2f)", 
+                    destination.c_str(), target.x, target.y);
+
+        publishStatus("NAVIGATING_TO_" + destination);
+        sendGoal(target.x, target.y);
+        return true;
+    }
+
+    // 📌 cancelAndReturnHome 개선: async_cancel 콜백으로 귀환 타이밍 보장
+    void cancelAndReturnHome() {
+        RCLCPP_INFO(this->get_logger(), "[취소 명령 수신] 이동 취소 후 HOME으로 복귀 요청...");
+        publishStatus("CANCEL_AND_RETURNING_HOME");
+
+        // 수동 조종 중이었다면 먼저 멈춰서 Nav2 이동과 겹치지 않게 합니다.
+        if (manual_drive_timer_) {
+            manual_drive_timer_->cancel();
+        }
+
+        if (this->action_client_) {
+            // 현재 실행 중인 Goal들을 취소 요청하고, 취소가 끝난 후 HOME으로 이동
+            this->action_client_->async_cancel_all_goals(
+                [this](auto result) {
+                    (void)result;
+                    RCLCPP_INFO(this->get_logger(), "이전 목표 취소 완료. HOME으로 복귀합니다.");
+                    
+                    Location home = location_map_.count("HOME") ? location_map_["HOME"] : Location{-0.13, 0.00};
+                    this->sendGoal(home.x, home.y);
+                }
+            );
+        }
+    }
+
+    // 📌 수동 조종 명령 처리 (forward/backward/left/right/stop)
+    // 대부분의 diff-drive 컨트롤러는 /cmd_vel에 watchdog(예: 0.5초 무통신 시 자동 정지)을 걸어두므로,
+    // 한 번만 publish하면 로봇이 잠깐 움직이다 멈춰버립니다.
+    // 그래서 방향이 바뀔 때마다 목표 속도를 갱신하고, 그 속도를 타이머로 계속 재발행합니다.
+    bool manualDrive(const std::string& direction) {
+        const double LINEAR_SPEED = 0.2;   // m/s
+        const double ANGULAR_SPEED = 0.5;  // rad/s
+
+        geometry_msgs::msg::Twist twist;
+        if (direction == "forward") {
+            twist.linear.x = LINEAR_SPEED;
+        } else if (direction == "backward") {
+            twist.linear.x = -LINEAR_SPEED;
+        } else if (direction == "left") {
+            twist.angular.z = ANGULAR_SPEED;
+        } else if (direction == "right") {
+            twist.angular.z = -ANGULAR_SPEED;
+        } else if (direction == "stop") {
+            // linear/angular 모두 기본값 0 (정지)
+        } else {
+            RCLCPP_WARN(this->get_logger(), "알 수 없는 수동 제어 명령입니다: %s", direction.c_str());
+            return false;
+        }
+
+        current_twist_ = twist;
+        cmd_vel_pub_->publish(current_twist_);
+        RCLCPP_INFO(this->get_logger(), "[수동 제어] %s (linear.x=%.2f, angular.z=%.2f)",
+                    direction.c_str(), twist.linear.x, twist.angular.z);
+
+        if (direction == "stop") {
+            // 정지 명령은 반복 발행할 필요 없이 타이머를 종료합니다.
+            if (manual_drive_timer_) {
+                manual_drive_timer_->cancel();
+            }
+        } else if (!manual_drive_timer_) {
+            // 첫 이동 명령일 때만 타이머를 새로 만듭니다 (100ms 주기 재발행).
+            manual_drive_timer_ = this->create_wall_timer(100ms, [this]() {
+                cmd_vel_pub_->publish(current_twist_);
+            });
+        }
+        return true;
+    }
+
+    // manual_mode가 꺼지거나 연결이 끊겼을 때 안전하게 로봇을 멈춥니다.
+    void stopManualDrive() {
+        if (manual_drive_timer_) {
+            manual_drive_timer_->cancel();
+        }
+        current_twist_ = geometry_msgs::msg::Twist();
+        cmd_vel_pub_->publish(current_twist_);
+    }
+
+private:
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_publisher_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
+    rclcpp_action::Client<NavigateToPose>::SharedPtr action_client_;
+    rclcpp::TimerBase::SharedPtr timer_;
+    rclcpp::TimerBase::SharedPtr manual_drive_timer_;
+    geometry_msgs::msg::Twist current_twist_;
+    std::map<std::string, Location> location_map_;
+
+    void setInitialPose() {
+        // 🚨 중요: 1회 발행 후 타이머 취소
+        this->timer_->cancel();
+
+        auto message = geometry_msgs::msg::PoseWithCovarianceStamped();
+        message.header.frame_id = "map";
+        message.header.stamp = this->now();
+
+        message.pose.pose.position.x = -2.0;
+        message.pose.pose.position.y = -0.5;
+        message.pose.pose.orientation.w = 1.0;
+
+        // AMCL 가우시안 공분산 기본값 설정
+        message.pose.covariance[0] = 0.25;  // X
+        message.pose.covariance[7] = 0.25;  // Y
+        message.pose.covariance[35] = 0.068; // Yaw
+
+        this->initial_pose_pub_->publish(message);
+        RCLCPP_INFO(this->get_logger(), "📍 초기 위치 설정 완료 (-2.0, -0.5)");
+    }
+
+    void publishStatus(const std::string& status_text) {
+        if (status_publisher_) {
+            auto msg = std_msgs::msg::String();
+            msg.data = status_text;
+            status_publisher_->publish(msg);
+        }
+    }
+
+    void sendGoal(double x, double y) {
+        if (!this->action_client_->wait_for_action_server(3s)) {
+            RCLCPP_ERROR(this->get_logger(), "Nav2 Action Server가 연결되지 않았습니다!");
+            publishStatus("FAILED");
+            return;
+        }
+
+        auto goal_msg = NavigateToPose::Goal();
+        goal_msg.pose.header.frame_id = "map";
+        goal_msg.pose.header.stamp = this->now();
+        goal_msg.pose.pose.position.x = x;
+        goal_msg.pose.pose.position.y = y;
+        goal_msg.pose.pose.orientation.w = 1.0;
+
+        auto send_goal_options = rclcpp_action::Client<NavigateToPose>::SendGoalOptions();
+        
+        send_goal_options.result_callback = 
+            [this](const GoalHandleNavigateToPose::WrappedResult & result) {
+                switch (result.code) {
+                    case rclcpp_action::ResultCode::SUCCEEDED:
+                        RCLCPP_INFO(this->get_logger(), "🎯 목적지 도착 완료!");
+                        publishStatus("ARRIVED");
+                        break;
+                    case rclcpp_action::ResultCode::CANCELED:
+                        RCLCPP_INFO(this->get_logger(), "🛑 이동 명령이 취소되었습니다.");
+                        publishStatus("CANCELED");
+                        break;
+                    default:
+                        RCLCPP_ERROR(this->get_logger(), "❌ 목적지 이동 실패!");
+                        publishStatus("FAILED");
+                        break;
+                }
+            };
+
+        this->action_client_->async_send_goal(goal_msg, send_goal_options);
+    }
+};
+
+#endif // NAV2_MANAGER_HPP

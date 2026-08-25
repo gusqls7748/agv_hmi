@@ -54,7 +54,7 @@ colcon build --packages-select agv_hmi_server
 |---|---|---|---|
 | 1 | Nav2 (미리 켜져 있어야 함) | `ros2 launch nav2_bringup bringup_launch.py use_sim_time:=False` | RViz에서 맵/로봇 위치 정상 표시 |
 | 2 | C++ 백엔드 서버 | `cd ~/agv_hmi && source install/setup.bash && ros2 run agv_hmi_server agv_hmi_server` | `NetworkServer listening on port: 8080` 로그 |
-| 3 | Qt 팀용 터널 (8080) | `cloudflared tunnel --protocol http2 --url http://localhost:8080` | `https://xxxx.trycloudflare.com` 주소 발급 |
+<!-- | 3 | Qt 팀용 터널 (8080) | `cloudflared tunnel --protocol http2 --url http://localhost:8080` | `https://xxxx.trycloudflare.com` 주소 발급 | -->
 | 4 | 웹 HMI(.NET) 서버 | `RobotServer__BaseUrl=http://127.0.0.1:8080/ dotnet GuideRobot.WebHmi.dll --urls http://127.0.0.1:8000` | 정상 구동 로그 |
 | 5 | 웹 UI 팀용 터널 (8000) | `cloudflared tunnel --protocol http2 --url http://localhost:8000` | `https://yyyy.trycloudflare.com` 주소 발급 |
 
