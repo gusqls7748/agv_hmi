@@ -1,5 +1,0 @@
-<RCC>
-    <qresource prefix="/">
-        <file>hmi_design.qml</file>
-    </qresource>
-</RCC>
